@@ -35,12 +35,13 @@ internal static class Program
             OutputDirectory: "artifacts");
 
         var results = ExperimentRunner.Run(split, experiment).OrderBy(r => r.FinalValidationLoss).ToArray();
+        var maxRows = Math.Min(12, results.Length);
 
-        Console.WriteLine("MyMLLab experiment leaderboard (best validation loss first)");
+        Console.WriteLine($"MyMLLab experiment leaderboard (showing top {maxRows} of {results.Length})");
         Console.WriteLine(new string('-', 140));
         Console.WriteLine("rank opt  lr     l2      train_loss  val_loss    gap         grad_norm  epochs  status        w        b");
 
-        for (var i = 0; i < results.Length; i++)
+        for (var i = 0; i < maxRows; i++)
         {
             var result = results[i];
             Console.WriteLine(
@@ -379,16 +380,25 @@ internal static class RunDiagnostics
 {
     public static string AssessConvergence(double gradientNorm, double generalizationGap, int bestEpoch, int epochsRan)
     {
-        if (gradientNorm > 0.1)
+        // High gradient late in training means the run is still far from a minimum.
+        if (gradientNorm > 0.5 && epochsRan >= 200)
         {
             return "underfit";
         }
 
-        if (generalizationGap > 0.15)
+        // Moderate gradient often means we simply need more epochs or a better learning rate.
+        if (gradientNorm > 0.1)
+        {
+            return "still-learning";
+        }
+
+        // Positive gap means validation is meaningfully worse than train.
+        if (generalizationGap > 0.03)
         {
             return "overfit";
         }
 
+        // Best epoch significantly before final epoch indicates plateauing.
         if (bestEpoch < epochsRan - 15)
         {
             return "plateau";

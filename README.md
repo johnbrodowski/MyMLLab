@@ -19,8 +19,8 @@ A minimal but feature-rich, fully observable machine learning experimentation la
   - bias
   - gradient norm
 - Prediction error distribution metrics (mean, stddev, p50, p90).
-- Convergence diagnostics per run (`stable`, `plateau`, `underfit`, `overfit`).
-- Ranked leaderboard with explicit numeric rank and richer summary fields.
+- Convergence diagnostics per run (`stable`, `plateau`, `still-learning`, `underfit`, `overfit`).
+- Ranked leaderboard with explicit numeric rank, top-N console display, and richer summary fields.
 
 ## Run
 
