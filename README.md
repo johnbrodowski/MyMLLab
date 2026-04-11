@@ -1,5 +1,8 @@
 # MyMLLab
 
+<img width="883" height="253" alt="image" src="https://github.com/user-attachments/assets/aea5c8d1-a5fa-4a29-be60-a9fb43ec324f" />
+
+
 A minimal, purely C#, dependency-free machine learning experimentation lab. 
 
 MyMLLab builds a complete Machine Learning training pipeline from absolute scratch. Instead of hiding the math behind massive libraries like PyTorch or ML.NET, this project implements the fundamental calculus and statistics required to train a model in plain, readable C#. It is designed as an educational sandbox to help developers understand exactly how models learn.
