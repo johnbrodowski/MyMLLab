@@ -1,15 +1,25 @@
 # MyMLLab
 
-A minimal, observable machine learning experimentation lab implemented as a small .NET console app.
+A minimal but feature-rich, fully observable machine learning experimentation lab in a single .NET console app.
 
-## What it does today
+## Included capabilities
 
-- Generates a synthetic linear dataset with controlled Gaussian noise.
-- Splits data into train/validation sets.
-- Trains a linear regression model with gradient descent.
-- Runs a batch experiment over multiple learning rates.
-- Logs per-epoch metrics to CSV/JSON for each run.
-- Produces a ranked leaderboard by final validation loss.
+- Synthetic linear dataset generation with deterministic seed and configurable Gaussian noise.
+- Train/validation split with optional feature normalization using train-only statistics.
+- Linear regression training with:
+  - SGD optimizer
+  - Adam optimizer
+  - L2 regularization
+  - Early stopping
+- Experiment sweeps over optimizer, learning rate, and L2 penalty.
+- Per-epoch logging of:
+  - training loss
+  - validation loss
+  - weight
+  - bias
+  - gradient norm
+- Prediction error distribution metrics (mean, stddev, p50, p90).
+- Ranked leaderboard across all runs.
 
 ## Run
 
@@ -17,19 +27,12 @@ A minimal, observable machine learning experimentation lab implemented as a smal
 dotnet run --project MyMLLab/MyMLLab.csproj
 ```
 
-## Output
+## Artifacts
 
-Running the app creates an `artifacts/` directory with:
+The app writes to `artifacts/`:
 
-- `run_lr_<value>.csv`: epoch-by-epoch training/validation loss and parameter values
-- `run_lr_<value>.json`: structured summary + full metric series
-- `leaderboard.csv`: ranked experiment summary
+- `run_opt_<optimizer>_lr_<lr>_l2_<l2>.csv`
+- `run_opt_<optimizer>_lr_<lr>_l2_<l2>.json`
+- `leaderboard.csv`
 
-## Why this project exists
-
-MyMLLab is intentionally small and explicit so changes are easy to reason about:
-
-- **Transparency:** model parameters and training dynamics are visible.
-- **Controlled simplicity:** start with linear models and iterate.
-- **Measurable iteration:** each experiment run emits comparable metrics.
-- **Experiment-first workflow:** compare configurations side by side.
+All outputs are designed to support side-by-side analysis and reproducible experimentation.
