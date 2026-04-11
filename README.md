@@ -37,3 +37,8 @@ The app writes to `artifacts/`:
 - `leaderboard.csv`
 
 All outputs are designed to support side-by-side analysis and reproducible experimentation.
+
+
+## Code Notes
+
+The `Program.cs` pipeline is extensively documented with XML and inline comments so each component, metric, and training decision is easy to inspect and modify.

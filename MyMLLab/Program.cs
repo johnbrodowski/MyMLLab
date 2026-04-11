@@ -4,11 +4,18 @@ using System.Text.Json;
 
 namespace MyMLLab;
 
+/// <summary>
+/// Application entrypoint for MyMLLab.
+/// Orchestrates dataset preparation, experiment sweeps, training, ranking, and artifact output.
+/// </summary>
 internal static class Program
 {
+    /// <summary>
+    /// Runs the full ML experiment pipeline from configuration through ranked reporting.
+    /// </summary>
     private static void Main()
     {
-        // Keep all high-level knobs visible in one place for easy experimentation.
+        // Global dataset configuration: controls synthetic data shape, noise, and reproducibility.
         var datasetConfig = new DatasetDefinition(
             Count: 240,
             Slope: 2.5,
@@ -20,10 +27,10 @@ internal static class Program
             TrainRatio: 0.8,
             NormalizeFeature: true);
 
-        // Data pipeline: synthesize -> split -> (optional) normalize.
+        // Data pipeline: synthesize examples, split train/validation, optionally normalize features.
         var split = DatasetEngine.Prepare(datasetConfig);
 
-        // Broader sweep gives better coverage of optimizer hyperparameter interactions.
+        // Experiment configuration: defines the sweep space and training controls.
         var experiment = new ExperimentDefinition(
             Epochs: 220,
             EarlyStoppingPatience: 25,
@@ -34,13 +41,18 @@ internal static class Program
             L2Penalties: new[] { 0.0, 0.001, 0.01 },
             OutputDirectory: "artifacts");
 
+        // Execute all runs, then sort so best validation loss appears first.
         var results = ExperimentRunner.Run(split, experiment).OrderBy(r => r.FinalValidationLoss).ToArray();
+
+        // Keep console output concise while still preserving full details in artifacts.
         var maxRows = Math.Min(12, results.Length);
 
+        // Print leaderboard header.
         Console.WriteLine($"MyMLLab experiment leaderboard (showing top {maxRows} of {results.Length})");
         Console.WriteLine(new string('-', 140));
         Console.WriteLine("rank opt  lr     l2      train_loss  val_loss    gap         grad_norm  epochs  status        w        b");
 
+        // Print top-N leaderboard rows.
         for (var i = 0; i < maxRows; i++)
         {
             var result = results[i];
@@ -50,51 +62,79 @@ internal static class Program
                 $"{result.FinalGradientNorm,10:0.000000} {result.EpochsRan,6}  {result.ConvergenceStatus,-12} {result.FinalWeight,8:0.0000} {result.FinalBias,8:0.0000}");
         }
 
+        // Surface where CSV/JSON artifacts were saved.
         Console.WriteLine($"\nArtifacts written to: {Path.GetFullPath(experiment.OutputDirectory)}");
     }
 }
 
+/// <summary>
+/// Responsible for dataset generation, splitting, and optional feature normalization.
+/// </summary>
 internal static class DatasetEngine
 {
+    /// <summary>
+    /// Builds a complete dataset split from a dataset definition.
+    /// </summary>
+    /// <param name="definition">Synthetic-data configuration and preprocessing toggles.</param>
+    /// <returns>Train/validation split and normalization metadata.</returns>
     public static DatasetSplit Prepare(DatasetDefinition definition)
     {
+        // Generate raw synthetic points.
         var raw = GenerateLinear(definition);
+
+        // Compute deterministic split boundary.
         var trainCount = (int)(raw.Count * definition.TrainRatio);
         var train = raw.Take(trainCount).ToArray();
         var validation = raw.Skip(trainCount).ToArray();
 
-        // Normalize feature using only train partition statistics to avoid data leakage.
+        // If normalization is disabled, return data as-is.
         if (!definition.NormalizeFeature)
         {
             return new DatasetSplit(train, validation, Normalization.None);
         }
 
+        // Compute normalization stats from train only to avoid validation leakage.
         var mean = train.Average(p => p.X);
         var variance = train.Average(p => (p.X - mean) * (p.X - mean));
         var stdDev = Math.Sqrt(Math.Max(variance, 1e-12));
 
+        // Apply same train-derived normalization to both partitions.
         var normalizedTrain = train.Select(p => new DataPoint((p.X - mean) / stdDev, p.Y)).ToArray();
         var normalizedValidation = validation.Select(p => new DataPoint((p.X - mean) / stdDev, p.Y)).ToArray();
 
         return new DatasetSplit(normalizedTrain, normalizedValidation, new Normalization(mean, stdDev));
     }
 
+    /// <summary>
+    /// Creates synthetic linear-regression data with additive Gaussian noise.
+    /// </summary>
     private static IReadOnlyList<DataPoint> GenerateLinear(DatasetDefinition definition)
     {
+        // Seeded RNG keeps experiments reproducible.
         var random = new Random(definition.Seed);
         var points = new List<DataPoint>(capacity: definition.Count);
 
+        // Build all points one by one.
         for (var i = 0; i < definition.Count; i++)
         {
+            // Sample X uniformly from configured range.
             var x = definition.MinX + (definition.MaxX - definition.MinX) * random.NextDouble();
+
+            // Sample additive Gaussian noise.
             var noise = NextGaussian(random) * definition.NoiseStdDev;
+
+            // Generate target according to y = slope*x + intercept + noise.
             var y = definition.Slope * x + definition.Intercept + noise;
+
             points.Add(new DataPoint(x, y));
         }
 
         return points;
     }
 
+    /// <summary>
+    /// Generates a standard-normal random number using the Box-Muller transform.
+    /// </summary>
     private static double NextGaussian(Random random)
     {
         var u1 = 1.0 - random.NextDouble();
@@ -103,20 +143,31 @@ internal static class DatasetEngine
     }
 }
 
+/// <summary>
+/// Executes the experiment sweep over optimizers, learning rates, and L2 penalties.
+/// </summary>
 internal static class ExperimentRunner
 {
+    /// <summary>
+    /// Runs all configured experiment combinations and returns per-run summaries.
+    /// </summary>
     public static IReadOnlyList<ExperimentResult> Run(DatasetSplit split, ExperimentDefinition definition)
     {
+        // Ensure output location exists before writing artifacts.
         Directory.CreateDirectory(definition.OutputDirectory);
         var results = new List<ExperimentResult>();
 
+        // Cartesian product over all configured knobs.
         foreach (var optimizer in definition.Optimizers)
         {
             foreach (var learningRate in definition.LearningRates)
             {
                 foreach (var l2 in definition.L2Penalties)
                 {
+                    // New model instance per run for isolation.
                     var model = new LinearRegressionModel(definition.InitialWeight, definition.InitialBias);
+
+                    // Train once for this hyperparameter combination.
                     var history = TrainingEngine.Train(
                         model,
                         split,
@@ -127,15 +178,18 @@ internal static class ExperimentRunner
                             L2Penalty: l2,
                             EarlyStoppingPatience: definition.EarlyStoppingPatience));
 
+                    // Compute error-distribution stats on validation set.
                     var finalErrors = split.Validation.Select(p => model.Predict(p.X) - p.Y).ToArray();
                     var errorStats = ErrorStatistics.From(finalErrors);
 
+                    // Pull latest tracked metrics for summary.
                     var finalTrainLoss = history.TrainingLossByEpoch[^1];
                     var finalValLoss = history.ValidationLossByEpoch[^1];
                     var finalGradNorm = history.GradientNormByEpoch[^1];
                     var epochsRan = history.TrainingLossByEpoch.Count;
                     var gap = finalValLoss - finalTrainLoss;
 
+                    // Build compact summary row for this run.
                     var summary = new ExperimentResult(
                         Optimizer: optimizer,
                         LearningRate: learningRate,
@@ -155,33 +209,44 @@ internal static class ExperimentRunner
                         ErrorP90: errorStats.P90);
 
                     results.Add(summary);
+
+                    // Write per-run artifacts immediately.
                     MetricsLogger.Write(definition.OutputDirectory, summary, history, split.Normalization);
                 }
             }
         }
 
+        // Write aggregate leaderboard across all runs.
         MetricsLogger.WriteLeaderboard(definition.OutputDirectory, results);
         return results;
     }
 }
 
+/// <summary>
+/// Handles model parameter updates and per-epoch metric tracking.
+/// </summary>
 internal static class TrainingEngine
 {
+    /// <summary>
+    /// Trains a linear model using the requested optimizer and settings.
+    /// </summary>
     public static TrainingHistory Train(LinearRegressionModel model, DatasetSplit split, TrainingConfig config)
     {
+        // Allocate metric history buffers.
         var trainingLoss = new List<double>(config.Epochs);
         var validationLoss = new List<double>(config.Epochs);
         var weights = new List<double>(config.Epochs);
         var biases = new List<double>(config.Epochs);
         var gradNorms = new List<double>(config.Epochs);
 
+        // Best-checkpoint tracking for early stopping restore.
         var bestValidation = double.MaxValue;
         var bestEpoch = 0;
         var bestWeight = model.Weight;
         var bestBias = model.Bias;
         var stagnantEpochs = 0;
 
-        // Adam state.
+        // Adam optimizer moment/variance state.
         var mW = 0.0;
         var mB = 0.0;
         var vW = 0.0;
@@ -190,8 +255,10 @@ internal static class TrainingEngine
         const double beta2 = 0.999;
         const double epsilon = 1e-8;
 
+        // Main epoch loop.
         for (var epoch = 1; epoch <= config.Epochs; epoch++)
         {
+            // Accumulate full-batch gradients.
             var gradW = 0.0;
             var gradB = 0.0;
 
@@ -203,43 +270,52 @@ internal static class TrainingEngine
                 gradB += error;
             }
 
+            // Convert sums to MSE gradients.
             var trainSize = split.Train.Length;
             gradW = (2.0 / trainSize) * gradW;
             gradB = (2.0 / trainSize) * gradB;
 
-            // L2 regularization on weight only.
+            // Add L2 term for weight only.
             gradW += config.L2Penalty * model.Weight;
 
+            // Branch on optimizer.
             if (config.Optimizer == OptimizerKind.Adam)
             {
+                // Update first and second moments.
                 mW = beta1 * mW + (1.0 - beta1) * gradW;
                 mB = beta1 * mB + (1.0 - beta1) * gradB;
                 vW = beta2 * vW + (1.0 - beta2) * gradW * gradW;
                 vB = beta2 * vB + (1.0 - beta2) * gradB * gradB;
 
+                // Bias-corrected moments.
                 var mWHat = mW / (1.0 - Math.Pow(beta1, epoch));
                 var mBHat = mB / (1.0 - Math.Pow(beta1, epoch));
                 var vWHat = vW / (1.0 - Math.Pow(beta2, epoch));
                 var vBHat = vB / (1.0 - Math.Pow(beta2, epoch));
 
+                // Parameter updates.
                 model.Weight -= config.LearningRate * mWHat / (Math.Sqrt(vWHat) + epsilon);
                 model.Bias -= config.LearningRate * mBHat / (Math.Sqrt(vBHat) + epsilon);
             }
             else
             {
+                // Vanilla SGD updates.
                 model.Weight -= config.LearningRate * gradW;
                 model.Bias -= config.LearningRate * gradB;
             }
 
+            // Evaluate losses after update.
             var trainLoss = CalculateMse(model, split.Train);
             var valLoss = CalculateMse(model, split.Validation);
 
+            // Persist per-epoch metrics.
             trainingLoss.Add(trainLoss);
             validationLoss.Add(valLoss);
             weights.Add(model.Weight);
             biases.Add(model.Bias);
             gradNorms.Add(Math.Sqrt(gradW * gradW + gradB * gradB));
 
+            // Best-checkpoint update and early-stop bookkeeping.
             if (valLoss < bestValidation)
             {
                 bestValidation = valLoss;
@@ -253,19 +329,23 @@ internal static class TrainingEngine
                 stagnantEpochs++;
             }
 
+            // Early stopping condition.
             if (stagnantEpochs >= config.EarlyStoppingPatience)
             {
                 break;
             }
         }
 
-        // Restore best checkpoint after early stopping.
+        // Restore best validation checkpoint.
         model.Weight = bestWeight;
         model.Bias = bestBias;
 
         return new TrainingHistory(trainingLoss, validationLoss, weights, biases, gradNorms, bestEpoch);
     }
 
+    /// <summary>
+    /// Computes mean squared error for a model over a dataset.
+    /// </summary>
     private static double CalculateMse(LinearRegressionModel model, IReadOnlyList<DataPoint> points)
     {
         var squaredError = 0.0;
@@ -280,14 +360,22 @@ internal static class TrainingEngine
     }
 }
 
+/// <summary>
+/// Writes per-run and aggregate experiment artifacts to disk.
+/// </summary>
 internal static class MetricsLogger
 {
+    /// <summary>
+    /// Writes one run's metrics in CSV and JSON formats.
+    /// </summary>
     public static void Write(string outputDirectory, ExperimentResult summary, TrainingHistory history, Normalization normalization)
     {
+        // Build deterministic run id used in file names.
         var runId = BuildRunId(summary.Optimizer, summary.LearningRate, summary.L2Penalty);
         var csvPath = Path.Combine(outputDirectory, $"run_{runId}.csv");
         var jsonPath = Path.Combine(outputDirectory, $"run_{runId}.json");
 
+        // Build CSV payload (epoch-by-epoch trajectory).
         var csv = new StringBuilder();
         csv.AppendLine("epoch,training_loss,validation_loss,weight,bias,gradient_norm");
 
@@ -304,6 +392,7 @@ internal static class MetricsLogger
 
         File.WriteAllText(csvPath, csv.ToString());
 
+        // Build rich JSON payload for programmatic inspection.
         var payload = new
         {
             summary.Optimizer,
@@ -334,6 +423,9 @@ internal static class MetricsLogger
         File.WriteAllText(jsonPath, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
     }
 
+    /// <summary>
+    /// Writes aggregate leaderboard CSV sorted by final validation loss.
+    /// </summary>
     public static void WriteLeaderboard(string outputDirectory, IEnumerable<ExperimentResult> results)
     {
         var ordered = results.OrderBy(r => r.FinalValidationLoss).ToArray();
@@ -368,6 +460,9 @@ internal static class MetricsLogger
         File.WriteAllText(path, csv.ToString());
     }
 
+    /// <summary>
+    /// Builds a compact, deterministic slug used for run artifact filenames.
+    /// </summary>
     private static string BuildRunId(OptimizerKind optimizer, double learningRate, double l2)
     {
         var lrSlug = learningRate.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', '_');
@@ -376,29 +471,31 @@ internal static class MetricsLogger
     }
 }
 
+/// <summary>
+/// Produces simple human-readable convergence labels from run-level metrics.
+/// </summary>
 internal static class RunDiagnostics
 {
+    /// <summary>
+    /// Assigns a convergence status string using heuristic thresholds.
+    /// </summary>
     public static string AssessConvergence(double gradientNorm, double generalizationGap, int bestEpoch, int epochsRan)
     {
-        // High gradient late in training means the run is still far from a minimum.
         if (gradientNorm > 0.5 && epochsRan >= 200)
         {
             return "underfit";
         }
 
-        // Moderate gradient often means we simply need more epochs or a better learning rate.
         if (gradientNorm > 0.1)
         {
             return "still-learning";
         }
 
-        // Positive gap means validation is meaningfully worse than train.
         if (generalizationGap > 0.03)
         {
             return "overfit";
         }
 
-        // Best epoch significantly before final epoch indicates plateauing.
         if (bestEpoch < epochsRan - 15)
         {
             return "plateau";
@@ -408,8 +505,14 @@ internal static class RunDiagnostics
     }
 }
 
+/// <summary>
+/// Computes descriptive statistics for prediction-error arrays.
+/// </summary>
 internal static class ErrorStatistics
 {
+    /// <summary>
+    /// Computes mean, standard deviation, and selected quantiles.
+    /// </summary>
     public static ErrorSummary From(IReadOnlyList<double> errors)
     {
         var ordered = errors.OrderBy(e => e).ToArray();
@@ -423,6 +526,9 @@ internal static class ErrorStatistics
             P90: Quantile(ordered, 0.90));
     }
 
+    /// <summary>
+    /// Computes a linearly-interpolated quantile from a sorted array.
+    /// </summary>
     private static double Quantile(IReadOnlyList<double> ordered, double q)
     {
         if (ordered.Count == 0)
@@ -444,28 +550,62 @@ internal static class ErrorStatistics
     }
 }
 
+/// <summary>
+/// Minimal one-feature linear model: y_hat = w*x + b.
+/// </summary>
 internal sealed class LinearRegressionModel(double initialWeight, double initialBias)
 {
+    /// <summary>
+    /// Trainable slope parameter.
+    /// </summary>
     public double Weight { get; set; } = initialWeight;
 
+    /// <summary>
+    /// Trainable intercept parameter.
+    /// </summary>
     public double Bias { get; set; } = initialBias;
 
+    /// <summary>
+    /// Predicts target value for one scalar feature input.
+    /// </summary>
     public double Predict(double x) => Weight * x + Bias;
 }
 
+/// <summary>
+/// Supported optimizer algorithms for this lab.
+/// </summary>
 internal enum OptimizerKind
 {
+    /// <summary>
+    /// Vanilla stochastic gradient descent (full-batch in current implementation).
+    /// </summary>
     Sgd,
+
+    /// <summary>
+    /// Adaptive Moment Estimation optimizer.
+    /// </summary>
     Adam
 }
 
+/// <summary>
+/// One supervised sample pair (X feature, Y target).
+/// </summary>
 internal readonly record struct DataPoint(double X, double Y);
 
+/// <summary>
+/// Feature normalization metadata used when normalization is enabled.
+/// </summary>
 internal readonly record struct Normalization(double Mean, double StdDev)
 {
+    /// <summary>
+    /// Sentinel values used when normalization is disabled.
+    /// </summary>
     public static Normalization None => new(0.0, 1.0);
 }
 
+/// <summary>
+/// Configuration describing synthetic dataset generation and preprocessing.
+/// </summary>
 internal sealed record DatasetDefinition(
     int Count,
     double Slope,
@@ -477,8 +617,14 @@ internal sealed record DatasetDefinition(
     double TrainRatio,
     bool NormalizeFeature);
 
+/// <summary>
+/// Prepared train/validation partitions plus normalization metadata.
+/// </summary>
 internal sealed record DatasetSplit(DataPoint[] Train, DataPoint[] Validation, Normalization Normalization);
 
+/// <summary>
+/// Experiment sweep definition across training hyperparameters.
+/// </summary>
 internal sealed record ExperimentDefinition(
     int Epochs,
     int EarlyStoppingPatience,
@@ -489,6 +635,9 @@ internal sealed record ExperimentDefinition(
     double[] L2Penalties,
     string OutputDirectory);
 
+/// <summary>
+/// One concrete training run configuration.
+/// </summary>
 internal sealed record TrainingConfig(
     int Epochs,
     double LearningRate,
@@ -496,6 +645,9 @@ internal sealed record TrainingConfig(
     double L2Penalty,
     int EarlyStoppingPatience);
 
+/// <summary>
+/// Compact summary for one completed run in the experiment sweep.
+/// </summary>
 internal sealed record ExperimentResult(
     OptimizerKind Optimizer,
     double LearningRate,
@@ -514,8 +666,14 @@ internal sealed record ExperimentResult(
     double ErrorP50,
     double ErrorP90);
 
+/// <summary>
+/// Descriptive statistics computed from prediction errors.
+/// </summary>
 internal sealed record ErrorSummary(double Mean, double StdDev, double P50, double P90);
 
+/// <summary>
+/// Full per-epoch history captured during training.
+/// </summary>
 internal sealed record TrainingHistory(
     IReadOnlyList<double> TrainingLossByEpoch,
     IReadOnlyList<double> ValidationLossByEpoch,
