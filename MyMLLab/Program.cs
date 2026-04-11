@@ -8,8 +8,7 @@ internal static class Program
 {
     private static void Main()
     {
-        // This is the single entry point for the lab.
-        // Intentionally keep it explicit so users can quickly see and modify each stage.
+        // Keep all high-level knobs visible in one place for easy experimentation.
         var datasetConfig = new DatasetDefinition(
             Count: 240,
             Slope: 2.5,
@@ -21,31 +20,33 @@ internal static class Program
             TrainRatio: 0.8,
             NormalizeFeature: true);
 
-        // Generate deterministic synthetic data, then split into train/validation partitions.
+        // Data pipeline: synthesize -> split -> (optional) normalize.
         var split = DatasetEngine.Prepare(datasetConfig);
 
-        // Define a sweep across optimizers, learning rates, and regularization strengths.
-        // This is the core "experiment-first" workflow.
+        // Broader sweep gives better coverage of optimizer hyperparameter interactions.
         var experiment = new ExperimentDefinition(
-            Epochs: 200,
-            EarlyStoppingPatience: 20,
+            Epochs: 220,
+            EarlyStoppingPatience: 25,
             InitialWeight: 0.0,
             InitialBias: 0.0,
-            LearningRates: new[] { 0.001, 0.01, 0.05 },
+            LearningRates: new[] { 0.001, 0.005, 0.01, 0.03, 0.05, 0.1 },
             Optimizers: new[] { OptimizerKind.Sgd, OptimizerKind.Adam },
             L2Penalties: new[] { 0.0, 0.001, 0.01 },
             OutputDirectory: "artifacts");
 
-        var results = ExperimentRunner.Run(split, experiment);
+        var results = ExperimentRunner.Run(split, experiment).OrderBy(r => r.FinalValidationLoss).ToArray();
 
         Console.WriteLine("MyMLLab experiment leaderboard (best validation loss first)");
-        Console.WriteLine("----------------------------------------------------------------");
-        foreach (var result in results.OrderBy(r => r.FinalValidationLoss))
+        Console.WriteLine(new string('-', 140));
+        Console.WriteLine("rank opt  lr     l2      train_loss  val_loss    gap         grad_norm  epochs  status        w        b");
+
+        for (var i = 0; i < results.Length; i++)
         {
+            var result = results[i];
             Console.WriteLine(
-                $"rank? opt={result.Optimizer,-4} lr={result.LearningRate,-6:0.###} l2={result.L2Penalty,-7:0.###} " +
-                $"train={result.FinalTrainingLoss,10:0.000000} val={result.FinalValidationLoss,10:0.000000} " +
-                $"w={result.FinalWeight,8:0.0000} b={result.FinalBias,8:0.0000} best@{result.BestEpoch,3}");
+                $"{i + 1,4} {result.Optimizer,-4} {result.LearningRate,6:0.###} {result.L2Penalty,7:0.###} " +
+                $"{result.FinalTrainingLoss,10:0.000000} {result.FinalValidationLoss,10:0.000000} {result.GeneralizationGap,10:0.000000} " +
+                $"{result.FinalGradientNorm,10:0.000000} {result.EpochsRan,6}  {result.ConvergenceStatus,-12} {result.FinalWeight,8:0.0000} {result.FinalBias,8:0.0000}");
         }
 
         Console.WriteLine($"\nArtifacts written to: {Path.GetFullPath(experiment.OutputDirectory)}");
@@ -54,7 +55,6 @@ internal static class Program
 
 internal static class DatasetEngine
 {
-    // Build a full dataset pipeline: generation -> split -> optional normalization.
     public static DatasetSplit Prepare(DatasetDefinition definition)
     {
         var raw = GenerateLinear(definition);
@@ -62,7 +62,7 @@ internal static class DatasetEngine
         var train = raw.Take(trainCount).ToArray();
         var validation = raw.Skip(trainCount).ToArray();
 
-        // Normalize with train statistics only to avoid validation leakage.
+        // Normalize feature using only train partition statistics to avoid data leakage.
         if (!definition.NormalizeFeature)
         {
             return new DatasetSplit(train, validation, Normalization.None);
@@ -94,7 +94,6 @@ internal static class DatasetEngine
         return points;
     }
 
-    // Box-Muller transform for deterministic Gaussian noise.
     private static double NextGaussian(Random random)
     {
         var u1 = 1.0 - random.NextDouble();
@@ -110,7 +109,6 @@ internal static class ExperimentRunner
         Directory.CreateDirectory(definition.OutputDirectory);
         var results = new List<ExperimentResult>();
 
-        // Cartesian sweep across optimizer/lr/l2 settings.
         foreach (var optimizer in definition.Optimizers)
         {
             foreach (var learningRate in definition.LearningRates)
@@ -131,15 +129,25 @@ internal static class ExperimentRunner
                     var finalErrors = split.Validation.Select(p => model.Predict(p.X) - p.Y).ToArray();
                     var errorStats = ErrorStatistics.From(finalErrors);
 
+                    var finalTrainLoss = history.TrainingLossByEpoch[^1];
+                    var finalValLoss = history.ValidationLossByEpoch[^1];
+                    var finalGradNorm = history.GradientNormByEpoch[^1];
+                    var epochsRan = history.TrainingLossByEpoch.Count;
+                    var gap = finalValLoss - finalTrainLoss;
+
                     var summary = new ExperimentResult(
                         Optimizer: optimizer,
                         LearningRate: learningRate,
                         L2Penalty: l2,
-                        FinalTrainingLoss: history.TrainingLossByEpoch[^1],
-                        FinalValidationLoss: history.ValidationLossByEpoch[^1],
+                        FinalTrainingLoss: finalTrainLoss,
+                        FinalValidationLoss: finalValLoss,
                         FinalWeight: history.WeightByEpoch[^1],
                         FinalBias: history.BiasByEpoch[^1],
                         BestEpoch: history.BestEpoch,
+                        EpochsRan: epochsRan,
+                        FinalGradientNorm: finalGradNorm,
+                        GeneralizationGap: gap,
+                        ConvergenceStatus: RunDiagnostics.AssessConvergence(finalGradNorm, gap, history.BestEpoch, epochsRan),
                         ErrorMean: errorStats.Mean,
                         ErrorStdDev: errorStats.StdDev,
                         ErrorP50: errorStats.P50,
@@ -166,14 +174,13 @@ internal static class TrainingEngine
         var biases = new List<double>(config.Epochs);
         var gradNorms = new List<double>(config.Epochs);
 
-        // Keep best validation state for early stopping rollback.
         var bestValidation = double.MaxValue;
         var bestEpoch = 0;
         var bestWeight = model.Weight;
         var bestBias = model.Bias;
         var stagnantEpochs = 0;
 
-        // Optimizer state (used only by Adam; harmless for SGD path).
+        // Adam state.
         var mW = 0.0;
         var mB = 0.0;
         var vW = 0.0;
@@ -199,10 +206,9 @@ internal static class TrainingEngine
             gradW = (2.0 / trainSize) * gradW;
             gradB = (2.0 / trainSize) * gradB;
 
-            // L2 regularization (bias excluded by design).
+            // L2 regularization on weight only.
             gradW += config.L2Penalty * model.Weight;
 
-            // Apply chosen optimizer.
             if (config.Optimizer == OptimizerKind.Adam)
             {
                 mW = beta1 * mW + (1.0 - beta1) * gradW;
@@ -248,12 +254,11 @@ internal static class TrainingEngine
 
             if (stagnantEpochs >= config.EarlyStoppingPatience)
             {
-                // Stop once validation has plateaued.
                 break;
             }
         }
 
-        // Restore best observed weights so exported artifacts represent the best checkpoint.
+        // Restore best checkpoint after early stopping.
         model.Weight = bestWeight;
         model.Bias = bestBias;
 
@@ -308,6 +313,10 @@ internal static class MetricsLogger
             summary.FinalWeight,
             summary.FinalBias,
             summary.BestEpoch,
+            summary.EpochsRan,
+            summary.FinalGradientNorm,
+            summary.GeneralizationGap,
+            summary.ConvergenceStatus,
             summary.ErrorMean,
             summary.ErrorStdDev,
             summary.ErrorP50,
@@ -330,7 +339,7 @@ internal static class MetricsLogger
         var path = Path.Combine(outputDirectory, "leaderboard.csv");
 
         var csv = new StringBuilder();
-        csv.AppendLine("rank,optimizer,learning_rate,l2_penalty,final_training_loss,final_validation_loss,best_epoch,final_weight,final_bias,error_mean,error_std_dev,error_p50,error_p90");
+        csv.AppendLine("rank,optimizer,learning_rate,l2_penalty,final_training_loss,final_validation_loss,generalization_gap,final_gradient_norm,best_epoch,epochs_ran,convergence_status,final_weight,final_bias,error_mean,error_std_dev,error_p50,error_p90");
 
         for (var i = 0; i < ordered.Length; i++)
         {
@@ -342,7 +351,11 @@ internal static class MetricsLogger
                 row.L2Penalty.ToString("0.###", CultureInfo.InvariantCulture),
                 row.FinalTrainingLoss.ToString("0.000000", CultureInfo.InvariantCulture),
                 row.FinalValidationLoss.ToString("0.000000", CultureInfo.InvariantCulture),
+                row.GeneralizationGap.ToString("0.000000", CultureInfo.InvariantCulture),
+                row.FinalGradientNorm.ToString("0.000000", CultureInfo.InvariantCulture),
                 row.BestEpoch,
+                row.EpochsRan,
+                row.ConvergenceStatus,
                 row.FinalWeight.ToString("0.000000", CultureInfo.InvariantCulture),
                 row.FinalBias.ToString("0.000000", CultureInfo.InvariantCulture),
                 row.ErrorMean.ToString("0.000000", CultureInfo.InvariantCulture),
@@ -359,6 +372,29 @@ internal static class MetricsLogger
         var lrSlug = learningRate.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', '_');
         var l2Slug = l2.ToString("0.###", CultureInfo.InvariantCulture).Replace('.', '_');
         return $"opt_{optimizer}_lr_{lrSlug}_l2_{l2Slug}".ToLowerInvariant();
+    }
+}
+
+internal static class RunDiagnostics
+{
+    public static string AssessConvergence(double gradientNorm, double generalizationGap, int bestEpoch, int epochsRan)
+    {
+        if (gradientNorm > 0.1)
+        {
+            return "underfit";
+        }
+
+        if (generalizationGap > 0.15)
+        {
+            return "overfit";
+        }
+
+        if (bestEpoch < epochsRan - 15)
+        {
+            return "plateau";
+        }
+
+        return "stable";
     }
 }
 
@@ -459,6 +495,10 @@ internal sealed record ExperimentResult(
     double FinalWeight,
     double FinalBias,
     int BestEpoch,
+    int EpochsRan,
+    double FinalGradientNorm,
+    double GeneralizationGap,
+    string ConvergenceStatus,
     double ErrorMean,
     double ErrorStdDev,
     double ErrorP50,
